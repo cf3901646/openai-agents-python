@@ -149,7 +149,8 @@ For provider-specific setup notes and links for the checked-in extension example
 | `DatabricksSandboxClient` | `databricks-openai[sandbox]` | [Databricks runner](https://github.com/databricks/databricks-ai-bridge/blob/main/integrations/openai/examples/sandbox_runner.py) |
 | `DaytonaSandboxClient` | `openai-agents[daytona]` | [Daytona runner](https://github.com/openai/openai-agents-python/blob/main/examples/sandbox/extensions/daytona/daytona_runner.py) |
 | `E2BSandboxClient` | `openai-agents[e2b]` | [E2B runner](https://github.com/openai/openai-agents-python/blob/main/examples/sandbox/extensions/e2b_runner.py) |
-| `ModalSandboxClient` | `openai-agents[modal]` | [Modal runner](https://github.com/openai/openai-agents-python/blob/main/examples/sandbox/extensions/modal_runner.py) |
+| `ModalSandboxClient` | `openai-agents[modal]` | [Modal runner](https-type://github.com/openai/openai-agents-python/blob/main/examples/sandbox/extensions/modal_runner.py) |
+| `SpritesSandboxClient` | `sprites-openai-agents` | [Sprites setup and usage](https://github.com/superfly/sprites-openai-agents) |
 | `VercelSandboxClient` | `openai-agents[vercel]` | [Vercel runner](https://github.com/openai/openai-agents-python/blob/main/examples/sandbox/extensions/vercel_runner.py) |
 
 </div>
