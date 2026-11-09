@@ -1,6 +1,6 @@
 //! One application instruction owner, published through Core's native history.
 
-use std::sync::{LazyLock, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use anyhow::{Context, Result, ensure};
 use codex_core_api::CodexThread;
@@ -363,8 +363,24 @@ fn receipt<'a>(
 }
 
 /// The caller holds the existing native operation and idle mutation gates.
+#[cfg(test)]
 pub async fn publish(thread: &CodexThread, text: String) -> Result<()> {
     publish_with_files(thread, text, Vec::new()).await
+}
+
+fn publication_envelope(
+    thread: &CodexThread,
+    text: &str,
+    files: Vec<InstructionFile>,
+) -> Result<ResponseItemEnvelope> {
+    let mut envelope = thread.annotate_client_response_item(publication(text));
+    if !files.is_empty() {
+        envelope
+            .metadata
+            .get_or_insert_with(Default::default)
+            .sdk_instruction_files = Some(serde_json::to_value(files)?);
+    }
+    Ok(envelope)
 }
 
 pub(crate) async fn publish_with_files(
@@ -372,19 +388,55 @@ pub(crate) async fn publish_with_files(
     text: String,
     files: Vec<InstructionFile>,
 ) -> Result<()> {
-    let item = publication(&text);
-    let mut envelope = thread.annotate_client_response_item(item);
-    if !files.is_empty() {
-        envelope
-            .metadata
-            .get_or_insert_with(Default::default)
-            .sdk_instruction_files = Some(serde_json::to_value(files)?);
-    }
+    let envelope = publication_envelope(thread, &text, files)?;
     publish_item(thread, envelope, None).await
+}
+
+/// Stage a first-turn publication. Core commits and flushes before invoking the
+/// receipt callback; pending instructions never contribute to world state.
+pub(crate) fn initial_turn(
+    thread: &Arc<CodexThread>,
+    text: String,
+    files: Vec<InstructionFile>,
+) -> Result<Arc<codex_core::InitialTurnInitialization>> {
+    let envelope = publication_envelope(thread, &text, files)?;
+    let committed = envelope.clone();
+    let weak = Arc::downgrade(thread);
+    let commit: Arc<
+        dyn Fn() -> futures_util::future::BoxFuture<'static, Result<()>> + Send + Sync,
+    > = Arc::new(move || {
+        let thread = weak.upgrade();
+        let envelope = committed.clone();
+        Box::pin(async move {
+            let thread = thread.context("initial instruction owner was closed")?;
+            confirm_publication(&thread, envelope, None).await
+        })
+    });
+    Ok(Arc::new(codex_core::InitialTurnInitialization::new(
+        vec![envelope],
+        commit,
+    )))
 }
 
 /// Confirm the published envelope before assigning the file sources for future sampling.
 pub(crate) async fn publish_item(
+    thread: &CodexThread,
+    envelope: ResponseItemEnvelope,
+    current_files: Option<Vec<InstructionFile>>,
+) -> Result<()> {
+    thread
+        .thread_extension_data()
+        .get::<Instructions>()
+        .context("application instruction updates require a managed Session")?;
+    accepted_envelope(&envelope)?.context("missing application instructions publication")?;
+    thread
+        .inject_response_item_envelopes(vec![envelope.clone()])
+        .await?;
+    thread.flush_rollout().await?;
+    confirm_publication(thread, envelope, current_files).await
+}
+
+async fn confirm_publication(
     thread: &CodexThread,
     envelope: ResponseItemEnvelope,
     current_files: Option<Vec<InstructionFile>>,
@@ -395,10 +447,6 @@ pub(crate) async fn publish_item(
         .context("application instruction updates require a managed Session")?;
     let accepted =
         accepted_envelope(&envelope)?.context("missing application instructions publication")?;
-    thread
-        .inject_response_item_envelopes(vec![envelope.clone()])
-        .await?;
-    thread.flush_rollout().await?;
     let live = thread.conversation_history_snapshot().await;
     receipt(live.items(), &envelope.item)?;
     let stored = thread.load_history(true).await?;

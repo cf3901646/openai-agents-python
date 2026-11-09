@@ -303,7 +303,11 @@
     {
       "path": "0090-native-session-media-history.patch",
       "sha256": "17c3e90f5903457e5b4b377186640c92b5c2152a4c4286ee6670157d124d06fa"
+    },
+    {
+      "path": "0068-sdk-managed-execution-lifecycle.patch",
+      "sha256": "e666df4d29e5613dd27f290f6b5e3cc579d16bd1ba402c1bccec90a60c245710"
     }
   ],
-  "result_tree": "c82459a4735f65c83102c85c94ec000b674fb6ab"
+  "result_tree": "b62dac70fc5f39e05c12c89d83b9424b7e88f740"
 }

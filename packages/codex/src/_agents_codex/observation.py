@@ -37,13 +37,14 @@ from ._events import (
 )
 from ._mcp_errors import _protect_mcp_methods
 from ._public import preserve_module_identity as _preserve_module_identity
-from .rate_limits import ApiRateLimits as ApiRateLimits
+from .rate_limits import ApiRateLimits as ApiRateLimits, _api_rate_limits as _api_rate_limits
 from .response_facts import (
     RecordedResponseFact as RecordedResponseFact,
     RecordedResponseFactSummary as RecordedResponseFactSummary,
+    _response_fact_record,
     _summarize_response_fact,
 )
-from .usage import TokenUsageInfo as TokenUsageInfo
+from .usage import TokenUsageInfo as TokenUsageInfo, _token_usage_info as _token_usage_info
 
 if TYPE_CHECKING:
     from .turn import Turn
@@ -428,6 +429,60 @@ class _ObservationBuffer:
             self.append(SessionEnded(session_id=self.session_id, reason=reason))
             self.closed = True
             self.notify()
+
+
+class _NativeObservationBuffer(_ObservationBuffer):
+    """One closed native suffix, decoded only when a passive reader asks."""
+
+    def __init__(self, session_id: str, archive: Any) -> None:
+        super().__init__(session_id)
+        self.sequence = archive.sequence
+        self.closed = archive.closed
+        if not self.closed:
+            raise RuntimeError("Native observation archive is not settled")
+        self._archive: Any = archive
+
+    def _check_read(self) -> None:
+        super()._check_read()
+        if self._archive is None:
+            return
+        value = json.loads(self._archive.json())
+        constructors: dict[str, Any] = {
+            "turn_started": TurnStarted,
+            "turn_finished": TurnFinished,
+            "model_request_dispatching": ModelRequestDispatching,
+            "model_response_linked": ModelResponseLinked,
+            "output_text_delta": OutputTextDelta,
+            "response_fact": ResponseFactReceived,
+            "usage_updated": UsageUpdated,
+            "api_rate_limits_updated": ApiRateLimitsUpdated,
+            "context_compacted": ContextCompacted,
+            "model_output_item_completed": ModelOutputItemCompleted,
+            "session_ended": SessionEnded,
+        }
+        retained: deque[tuple[Observation, int, int]] = deque()
+        for row in value["rows"]:
+            fields = dict(row)
+            kind = fields.pop("type")
+            if fields["session_id"] != self.session_id:
+                raise RuntimeError("Native observation belongs to another Session")
+            if kind == "response_fact":
+                record = _response_fact_record(fields["record"])
+                if record is None:
+                    raise RuntimeError("Native response fact was not validated")
+                fields["record"] = record
+            elif kind == "usage_updated":
+                fields["usage"] = _token_usage_info(fields["usage"])
+            elif kind == "api_rate_limits_updated":
+                fields["snapshot"] = _api_rate_limits(fields["snapshot"])
+                if fields["snapshot"] is None:
+                    raise RuntimeError("Native rate-limit observation was not validated")
+            event = constructors[kind](**fields)
+            # The native suffix is already bounded and immutable. These local
+            # accounting slots never participate in another publication.
+            retained.append((event, 0, 0))
+        self.records = retained
+        self._archive = None
 
 
 class EventStream(AsyncIterator[Observation]):

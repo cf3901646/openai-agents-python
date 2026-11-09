@@ -91,7 +91,11 @@ async def test_agent_run_preserves_full_retained_stream_for_subclass_and_canonic
     probes = instrument_reader(monkeypatch)
     provider = NativeProvider(base_url=responses.url, api_key="synthetic-batch-key")
     responses.replies.append(text_response("out", *chunks))
-    completed = await Agent(instructions="Answer directly.", provider=provider).run("input")
+    # State capture retains the ordinary reader, whose native/public projection
+    # this test compares. Native-owned no-state runs have separate parity tests.
+    completed = await Agent(instructions="Answer directly.", provider=provider).run(
+        "input", return_state=True
+    )
     retained = [event async for event in completed.turn.events()]
     assert completed.final_output == "".join(chunks)
     assert [event.delta for event in retained if isinstance(event, OutputTextDelta)] == list(chunks)
@@ -103,7 +107,9 @@ async def test_agent_run_preserves_full_retained_stream_for_subclass_and_canonic
     responses.requests.clear()
     responses.replies.append(text_response("out", *chunks))
     start = len(probes)
-    control = await OrdinaryControl(instructions="Answer directly.", provider=provider).run("input")
+    control = await OrdinaryControl(instructions="Answer directly.", provider=provider).run(
+        "input", return_state=True
+    )
     ordinary = [event async for event in control.turn.events()]
     assert completed.final_output == control.final_output
     assert completed.thread_usage == control.thread_usage
@@ -248,7 +254,7 @@ async def test_cancel_owned_run_receives_abort_without_cancelling_reader(respons
         instructions="Answer directly.",
         provider=NativeProvider(base_url=responses.url, api_key="synthetic-batch-key"),
     )
-    running = asyncio.create_task(agent.run("input"))
+    running = asyncio.create_task(agent.run("input", return_state=True))
     try:
         async with timeout(10):
             await emitted.wait()

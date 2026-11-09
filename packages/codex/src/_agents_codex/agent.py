@@ -22,7 +22,11 @@ from dataclasses import (
 )
 from pathlib import Path as Path
 from threading import RLock as RLock
-from types import MappingProxyType as MappingProxyType, TracebackType as TracebackType
+from types import (
+    MappingProxyType as MappingProxyType,
+    MethodType as MethodType,
+    TracebackType as TracebackType,
+)
 from typing import (
     TYPE_CHECKING as TYPE_CHECKING,
     Any as Any,
@@ -1020,6 +1024,49 @@ class Agent(Generic[ContextT, OutputT]):
         cannot modify. Each file's receipt identifies the exact bytes loaded.
         """
         initial_messages = _capture_initial_messages(initial_messages, state=state, resume=resume)
+        async with self._session_context(
+            context=context,
+            state=state,
+            initial_messages=initial_messages,
+            storage=storage,
+            resume=resume,
+            provider=provider,
+            model=model,
+            model_settings=model_settings,
+            environment=environment,
+            tools=tools,
+            instruction_files=instruction_files,
+            reconciled_calls=reconciled_calls,
+            parent_trace=parent_trace,
+            trace_options=trace_options,
+            on_interaction=on_interaction,
+            max_function_concurrency=max_function_concurrency,
+        ) as session:
+            yield session
+
+    @asynccontextmanager
+    async def _session_context(
+        self: Agent[SessionContextT, OutputT],
+        *,
+        context: SessionContextT | None = None,
+        state: SessionState | None = None,
+        initial_messages: Sequence[InitialMessage] | None = None,
+        storage: LocalStorage | CustomStorage | None = None,
+        resume: str | None = None,
+        provider: NativeProvider | None = None,
+        model: str | None = None,
+        model_settings: ModelSettings | None = None,
+        environment: EnvironmentSource[SessionContextT] | None = None,
+        tools: Sequence[Tool[SessionContextT]] | None = None,
+        instruction_files: Sequence[Path] = (),
+        reconciled_calls: Sequence[ReconciledCall] = (),
+        parent_trace: TraceContext | Mapping[str, str | None] | None = None,
+        trace_options: TraceOptions | Mapping[str, Any] | None = None,
+        on_interaction: _InteractionHandler | None = None,
+        max_function_concurrency: int | None = None,
+        _atomic_first_turn: bool = False,
+        _native_run: bool = False,
+    ) -> AsyncIterator[Session[SessionContextT, OutputT]]:
         if on_interaction is not None and not callable(on_interaction):
             raise TypeError("on_interaction must be callable or None")
         from .session import Session
@@ -1048,6 +1095,8 @@ class Agent(Generic[ContextT, OutputT]):
                 reconciled_calls=reconciled_calls,
                 max_function_concurrency=max_function_concurrency,
                 parent_trace=parent_trace,
+                _atomic_first_turn=_atomic_first_turn,
+                _native_run=_native_run,
                 **cast(
                     "_TracingOpeningOptions",
                     {"_tracing_context": captured.context} if captured.context is not None else {},
@@ -1351,10 +1400,33 @@ class Agent(Generic[ContextT, OutputT]):
                 options["max_function_concurrency"] = max_function_concurrency
             if environment is not None:
                 options["environment"] = environment
+            if (
+                isinstance(session_factory, MethodType)
+                and session_factory.__self__ is self
+                and session_factory.__func__ is _BUILTIN_SESSION_FACTORY
+                and state is None
+                and initial_messages is None
+                and input is not None
+                and tools is None
+                and environment is None
+                and before_step is None
+                and prepare_request is None
+                and on_interaction is None
+                and budget is None
+            ):
+                # Only the built-in one-shot opening may defer its initial
+                # instruction receipt to the first ordinary submission.
+                session_factory = self._session_context
+                options["_atomic_first_turn"] = True
+                options["_native_run"] = isinstance(input, str) and not return_state
             async with session_factory(
                 context=cast(SessionContextT, context),
                 **options,
             ) as session:
+                if session._native_run_ready:
+                    owned = await session._run_owned(cast(str, input))
+                    if owned is not None:
+                        return cast("Completed[OutputT]", owned)
                 if pause_manual or (prepare_request is not None and on_interaction is None):
                     # A delegating factory may change the opening roster or its
                     # default operation. Check the same effective selection that
@@ -1601,4 +1673,5 @@ class Agent(Generic[ContextT, OutputT]):
 
 
 _protect_mcp_methods(Agent, lambda owner: owner.tools)
+_BUILTIN_SESSION_FACTORY = Agent.session
 _preserve_module_identity(globals(), "agents.agent")

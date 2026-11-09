@@ -176,6 +176,7 @@ from .observation import (
     TurnFinished as TurnFinished,
     TurnStarted as TurnStarted,
     UsageUpdated as UsageUpdated,
+    _NativeObservationBuffer as _NativeObservationBuffer,
     _ObservationBuffer as _ObservationBuffer,
     _request_observation as _request_observation,
 )
@@ -1953,6 +1954,8 @@ class Session(Generic[ContextT, OutputT]):
         parent_trace: TraceContext | Mapping[str, str | None] | None = None,
         _tracing_context: str | None = None,
         _expected_codex_login_binding: str | None = None,
+        _atomic_first_turn: bool = False,
+        _native_run: bool = False,
     ) -> Session[ContextT, OutputT]:
         function_concurrency_omitted = max_function_concurrency is _MAX_FUNCTION_CONCURRENCY_UNSET
         if function_concurrency_omitted:
@@ -2189,6 +2192,31 @@ class Session(Generic[ContextT, OutputT]):
                     server.tool(name) in saved.operation_tools for name in server.tools
                 ):
                     server._check_context(context)
+        # Capture the supported ceiling before acquiring a provider lease.
+        # Excluded openings keep their durable zero-turn publication path.
+        _atomic_first_turn = (
+            _atomic_first_turn
+            and initial_messages_json is None
+            and selected is None
+            and state is None
+            and storage is None
+            and resume is None
+            and environment is None
+            and not instruction_files
+            and agent.provider is not None
+            and codex_login is None
+            and not agent.provider._websockets_enabled
+            and output.mode == "plain"
+            and not programmatic_tool_calling
+            and agent.transform_context is None
+            and agent.before_compact is None
+            and agent.before_complete is None
+            and all(
+                isinstance(tool, FunctionTool) and tool._bind is not None and not tool.defer_loading
+                for tool in available
+            )
+        )
+        _native_run = _native_run and _atomic_first_turn and not available
         lease = None
         owned_provider = False
         opening = _OpeningOwner()
@@ -2578,21 +2606,23 @@ class Session(Generic[ContextT, OutputT]):
                         ),
                     },
                 }
-                # Every conversation uses Core for model execution and history.
-                home = provider_lease.home()
-                assert home is not None
-                workspace = Path(home.name) / "workspace"
-                runtime.update(codex_home=home.name, cwd=str(workspace))
-                # Recreate storage for retained checkpoint data only. Saved data
-                # never enables model-facing planning or goal tools.
-                if state is not None and (
-                    state.root_goal is not None
-                    or any(child.goal is not None for child in state.descendants)
-                ):
-                    runtime["native_goal_store"] = home.name
-                workspace.mkdir(exist_ok=True)
-                if native_agents is not None:
-                    _configure_child_roles(config, home, native_agents)
+                # The private merged opener owns paths for eligible runtime scopes.
+                if not _atomic_first_turn:
+                    # Every conversation uses Core for model execution and history.
+                    home = provider_lease.home()
+                    assert home is not None
+                    workspace = Path(home.name) / "workspace"
+                    runtime.update(codex_home=home.name, cwd=str(workspace))
+                    # Recreate storage for retained checkpoint data only. Saved data
+                    # never enables model-facing planning or goal tools.
+                    if state is not None and (
+                        state.root_goal is not None
+                        or any(child.goal is not None for child in state.descendants)
+                    ):
+                        runtime["native_goal_store"] = home.name
+                    workspace.mkdir(exist_ok=True)
+                    if native_agents is not None:
+                        _configure_child_roles(config, home, native_agents)
 
                 async def initialize_engine() -> Any:
                     create_engine = (
@@ -2633,7 +2663,21 @@ class Session(Generic[ContextT, OutputT]):
                         )
                     )
 
-                engine = await initialize_engine()
+                if _atomic_first_turn:
+                    engine, thread, home = await opening.acquire(
+                        native._open_conversation(
+                            json.dumps(config),
+                            json.dumps(runtime),
+                            json.dumps(options),
+                            native_specs,
+                            json.dumps(settings),
+                            api_key=opening.api_key or "",
+                            provider_lease=provider_lease,
+                            _share_model_http=True,
+                        )
+                    )
+                else:
+                    engine = await initialize_engine()
 
                 if isinstance(storage, CustomStorage) and resume is not None:
                     # Inspect before Core starts, while the canonical backend's
@@ -2652,15 +2696,18 @@ class Session(Generic[ContextT, OutputT]):
                         r"^[^\S\x1c-\x1f]+|[^\S\x1c-\x1f]+\Z", "", provider.api_key
                     )
 
-                thread = await opening.acquire(
-                    engine._start_initial_replaceable_thread(
-                        json.dumps(options),
-                        native_specs,
-                        initial_messages_json=initial_messages_json,
+                if not _atomic_first_turn:
+                    thread = await opening.acquire(
+                        engine._start_initial_replaceable_thread(
+                            json.dumps(options),
+                            native_specs,
+                            initial_messages_json=initial_messages_json,
+                        )
+                        if checkpoint is None
+                        else engine.restore_checkpoint(
+                            checkpoint, json.dumps(options), native_specs
+                        )
                     )
-                    if checkpoint is None
-                    else engine.restore_checkpoint(checkpoint, json.dumps(options), native_specs)
-                )
                 session = cls(
                     engine,
                     thread,
@@ -2672,6 +2719,7 @@ class Session(Generic[ContextT, OutputT]):
                     instructions,
                     _start_readers=False,
                     max_function_concurrency=max_function_concurrency,
+                    _native_run=_native_run,
                 )
                 session._trace_context = _tracing_context
                 session._hosted_verification = hosted_verification or chatgpt_apps
@@ -2828,7 +2876,7 @@ class Session(Generic[ContextT, OutputT]):
                     # settings or instructions to an addressable local thread.
                     # Explicit model updates validate natively before writing.
                     await session._publish_startup(thread._validate_hosted_search_model())
-                if checkpoint is None and settings:
+                if checkpoint is None and settings and not _atomic_first_turn:
                     if (
                         await session._publish_startup(
                             thread._update_model_settings(json.dumps(settings))
@@ -2836,7 +2884,7 @@ class Session(Generic[ContextT, OutputT]):
                         is not True
                     ):
                         raise NativeError("Native model update acknowledgement did not match")
-                if checkpoint is None:
+                if checkpoint is None and not _atomic_first_turn:
                     if (
                         await session._publish_startup(
                             thread._update_instructions(
@@ -2902,7 +2950,8 @@ class Session(Generic[ContextT, OutputT]):
                         )
                     )
                     active.task = _create_task(session._execute(active, [], admitted=True))
-                session._start_readers()
+                if not _native_run:
+                    session._start_readers()
                 opening.disown(session)
                 session._environment_lease = lease
                 return session
@@ -2978,6 +3027,7 @@ class Session(Generic[ContextT, OutputT]):
         *,
         _start_readers: bool = True,
         max_function_concurrency: int | None = None,
+        _native_run: bool = False,
     ) -> None:
         self._trace_context: str | None = None
         self._provider_lease: Any = None
@@ -3068,6 +3118,7 @@ class Session(Generic[ContextT, OutputT]):
         self._fail_unhandled_questions = False
         self._close_task: asyncio.Task[None] | None = None
         self._scope_close_task: asyncio.Task[None] | None = None
+        self._native_scope_failure: BaseException | None = None
         self._interaction_handler: _InteractionHandler | None = None
         self._interaction_error: BaseException | None = None
         self._sync_cleanup_owner = _sync_run.get()
@@ -3079,13 +3130,23 @@ class Session(Generic[ContextT, OutputT]):
             weakref.WeakValueDictionary()
         )
         self._observations._callback_check = weakref.WeakMethod(self._check_callback_operation)
-        # The sole native reader owns questions during opening publication.
-        self._reader = _create_task(self._read_events())
+        self._native_run_ready = _native_run
+        # The native owner is the sole reader on its admitted path. Its resolved
+        # sentinel retains the ordinary close interface without a scheduled hop.
+        self._reader: asyncio.Future[None]
+        if _native_run:
+            self._reader = _future()
+            self._reader.set_result(None)
+        else:
+            self._reader = _create_task(self._read_events())
         self._mcp_reader: asyncio.Task[None] | None = None
         if _start_readers:
             self._start_readers()
 
     def _start_readers(self) -> None:
+        if self._native_run_ready:
+            self._native_run_ready = False
+            self._reader = _create_task(self._read_events())
         self._start_interception()
         if any(
             server.transform_result is not None or server.request_metadata is not None
@@ -6169,6 +6230,156 @@ class Session(Generic[ContextT, OutputT]):
                     raise error
 
         await _join(asyncio.create_task(finish_cancellation()))
+
+    async def _run_owned(self, input: str) -> Completed[str] | None:
+        """Run the admitted no-hook root and join its native cleanup owner."""
+        self._check_open()
+        if not self._native_run_ready:
+            return None
+        state = _Submission(
+            self._default_output,
+            tracing=_capture(fallback=self._trace_context),
+            parent_trace=self._parent_trace,
+        )
+        handle = _root_turn(self, None, uuid4().hex, state.completion)
+        state.issued = handle
+        request: dict[str, Any] = {
+            "mode": "start_if_idle",
+            "input": _native_input(input),
+            "observation_submission_id": handle.submission_id,
+        }
+        if state.parent_trace is not None:
+            request["trace"] = state.parent_trace.to_headers()
+        tracing_context = state.tracing.context if state.tracing is not None else None
+        if tracing_context is not None:
+            request["tracing_context"] = tracing_context
+        settled = False
+        try:
+            owner = self._native._run_owned(
+                self._engine,
+                json.dumps(request),
+                handle.submission_id,
+                home=self._home,
+                tracing_context=tracing_context,
+            )
+            if owner is None:
+                # Native rejection happens before model effects. Only this
+                # branch restores the ordinary reader and submit pipeline.
+                self._start_readers()
+                return None
+            self._native_run_ready = False
+            running = asyncio.ensure_future(owner.run())
+            cancelled: asyncio.CancelledError | None = None
+            while True:
+                try:
+                    encoded, archive, failures = await asyncio.shield(running)
+                    break
+                except asyncio.CancelledError as error:
+                    if running.done() and running.cancelled():
+                        raise
+                    cancelled = cancelled or error
+                    owner.cancel()
+            payload = json.loads(encoded)
+            self._closing = True
+            observations = _NativeObservationBuffer(self.id, archive)
+            observations._callback_check = self._observations._callback_check
+            self._observations = observations
+            turn_id = payload.get("turn_id")
+            if isinstance(turn_id, str) and turn_id:
+                object.__setattr__(handle, "turn_id", turn_id)
+                state.handle = handle
+                self._last_turn = handle
+                state.accepted.set_result(handle)
+            terminal = payload.get("terminal") or {}
+            state.terminal.set_result(terminal)
+            error: BaseException | None = None
+            outcome: Completed[str] | None = None
+            # Preserve actual native bridge exceptions rather than rebuilding
+            # their types, identity, or cleanup context from JSON strings.
+            phase_errors: dict[str, BaseException] = {}
+            for phase, failure in failures:
+                previous = phase_errors.get(phase)
+                if previous is None:
+                    phase_errors[phase] = failure
+                elif previous is not failure:
+                    _retain_cleanup_error(previous, failure, _error_contexts(previous.__context__))
+            error = phase_errors.get("submit") or phase_errors.get("reader")
+            reader_error = phase_errors.get("reader")
+            if error is not None and reader_error is not None and reader_error is not error:
+                _retain_cleanup_error(error, reader_error, _error_contexts(error.__context__))
+            model_failure = payload.get("model_failure")
+            raw_error = payload.get("error") or terminal.get("error")
+            if error is None and model_failure is not None:
+                error = _model_failure_error(model_failure)
+            if error is None and isinstance(raw_error, dict):
+                submission = raw_error.get("submission")
+                if isinstance(submission, dict):
+                    reason = submission["reason"]
+                    error = NativeError(
+                        reason.get("message") or f"Native input was not submitted: {reason['type']}"
+                    )
+                    if submission["status"] == "not_submitted":
+                        error._effects = "not_started"
+                else:
+                    error = _native_error(raw_error)
+            if error is None and (
+                payload.get("status") == "cancelled" or terminal.get("interrupted")
+            ):
+                error = asyncio.CancelledError()
+            if error is None:
+                if state.handle is None or payload.get("status") != "completed":
+                    error = NativeError("Native owned run did not complete")
+                else:
+                    text = self._validate_traced_output(state, payload["output"])
+                    outcome = Completed(handle, text, _token_usage_info(payload.get("usage")))
+            snapshot = _api_rate_limits(payload.get("api_rate_limits"))
+            if snapshot is not None:
+                self._api_rate_limit_snapshot = snapshot
+            cleanup_error = phase_errors.get("engine_close") or phase_errors.get("thread_close")
+            if cleanup_error is not None:
+                previous = phase_errors.get("thread_close")
+                if previous is not None and previous is not cleanup_error:
+                    _retain_cleanup_error(
+                        cleanup_error, previous, _error_contexts(cleanup_error.__context__)
+                    )
+            for phase, failure in phase_errors.items():
+                if phase not in {"submit", "reader", "thread_close", "engine_close"}:
+                    if cleanup_error is None:
+                        cleanup_error = failure
+                    elif cleanup_error is not failure:
+                        _retain_cleanup_error(
+                            cleanup_error, failure, _error_contexts(cleanup_error.__context__)
+                        )
+            retired = payload.get("retired") is True
+            if not retired and cleanup_error is None:
+                cleanup_error = NativeError("Native owned cleanup did not retire")
+            # Thread/Engine close belongs to the enclosing Session scope, after
+            # Turn settlement. Report that attempted close once on scope exit;
+            # only a later explicit aclose retries a still-live native owner.
+            self._native_scope_failure = cleanup_error
+            # No Python _execute task or reader owns this root. The archived
+            # TurnFinished already settled its observations; closed append is
+            # a no-op and this reuses ordinary outcome/tracing/error settlement.
+            self._settle_submission(state, True, error, outcome)
+            settled = True
+            if retired:
+                self._resources_retired = True
+                if cleanup_error is None:
+                    await self._release_provider_lease()
+            try:
+                result = state.completion.result()
+            except BaseException as error:
+                if cancelled is not None:
+                    _retain_cleanup_error(cancelled, error, _error_contexts(cancelled.__context__))
+                    raise cancelled  # noqa: B904 - preserve the caller's cause and cleanup contexts
+                raise
+            if cancelled is not None:
+                raise cancelled
+            return cast("Completed[str]", result)
+        finally:
+            if not settled and state.tracing is not None:
+                state.tracing.close(sys.exc_info()[1])
+                state.tracing = None
 
     async def _execute(
         self, state: _Submission, input: list[dict[str, Any]] | None, *, admitted: bool = False
@@ -9728,8 +9939,26 @@ class Session(Generic[ContextT, OutputT]):
             await _join(asyncio.create_task(asyncio.to_thread(owner.recover, self.aclose)))
             return
         self._check_callback_operation("close its own Session")
+        report_native_failure = self._native_scope_failure is not None
+        if report_native_failure:
+            failure, self._native_scope_failure = self._native_scope_failure, None
+            assert failure is not None
+
+            async def report_native_close() -> None:
+                if self._resources_retired:
+                    await _close_after_error(failure, self._release_provider_lease)
+                raise failure
+
+            # Reuse the ordinary scope-close error/cleanup owner wrapper. This
+            # reports the completed native attempt rather than silently retrying
+            # it during the same context exit.
+            self._scope_close_task = _create_task(report_native_close())
         task = self._scope_close_task
-        if task is None or (task.done() and (task.cancelled() or task.exception() is not None)):
+        if task is None or (
+            not report_native_failure
+            and task.done()
+            and (task.cancelled() or task.exception() is not None)
+        ):
             task = _create_task(self._exit_scope())
             self._scope_close_task = task
         try:
@@ -9976,8 +10205,10 @@ class Session(Generic[ContextT, OutputT]):
                     finally:
                         # A failed shutdown leaves the native event source live.
                         # Retire its existing read without waiting for a new event.
-                        if not engine_closed:
-                            cancel_once(self._reader)
+                        if not engine_closed and not self._reader.done():
+                            # The no-reader sentinel is already resolved; every
+                            # pending reader is the ordinary SDK-owned Task.
+                            cancel_once(cast(asyncio.Task[None], self._reader))
                         try:
                             await self._reader
                         finally:
